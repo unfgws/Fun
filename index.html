@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>John Doe</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:#efece5}
+  body{touch-action:none;user-select:none;-webkit-user-select:none;font-family:"Helvetica Neue",Helvetica,Arial,sans-serif}
+  canvas{position:fixed;inset:0;width:100%;height:100%;cursor:grab}
+  canvas.drag{cursor:grabbing}
+  #hint{position:fixed;left:0;right:0;bottom:max(22px,env(safe-area-inset-bottom));text-align:center;
+        font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#151515;opacity:0;transition:opacity .8s;pointer-events:none}
+  #hint.on{opacity:.5}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint"></div>
+
+<script>
+(() => {
+  /* ---------- tweak here ---------- */
+  const TEXT   = "hi, i'm john doe \u2014 Playing with stuff. Making things I like";
+  const TOUGH  = 1;        // higher = harder to snap, lower = snaps easier
+  const GRAV   = 1900;     // px/s^2
+  const PAPER  = '#efece5', INK = '#151515';
+  const WALLS  = { left: '#f0694b', right: '#8ea6ff', top: '#f1c24a', bottom: '#86c7a0' };
+  /* -------------------------------- */
+
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d'), hint = document.getElementById('hint');
+  const N = TEXT.length, TAU = Math.PI * 2;
+  let W = 0, H = 0, DPR = 1, fs = 24, sp = 15, pr = 8, diag = 1000;
+  let P = [], link = [], broken = false;
+  let base = PAPER, blooms = [];
+  let grab = null, ptr = { x: 0, y: 0 }, events = [];
+
+  /* ---------- sound (synthesized) ---------- */
+  let ac = null, lastSnd = 0;
+  const audio = () => { if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch { return null; } } if (ac.state === 'suspended') ac.resume(); return ac; };
+  function tone(f0, f1, dur, peak, type = 'sine', delay = 0) {
+    const a = ac; if (!a) return;
+    const t = a.currentTime + delay, o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(f1, 20), t + dur);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(peak, t + .006); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(a.destination); o.start(t); o.stop(t + dur + .05);
+  }
+  function noise(dur, peak, hp) {
+    const a = ac; if (!a) return;
+    const len = Math.floor(a.sampleRate * dur), buf = a.createBuffer(1, len, a.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+    const s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+    s.buffer = buf; f.type = 'highpass'; f.frequency.value = hp; g.gain.value = peak;
+    s.connect(f).connect(g).connect(a.destination); s.start();
+  }
+  const SCALE = [1, 9 / 8, 5 / 4, 3 / 2, 5 / 3];
+  function chime(i, imp) {
+    if (!ac) return;
+    const n = performance.now(); if (n - lastSnd < 45) return; lastSnd = n;
+    const f = 261.63 * SCALE[i % 5] * Math.pow(2, Math.floor(i / 5) % 2 + (i % 3 === 0 ? 1 : 0));
+    const v = Math.min(.2, .03 + imp * .00005);
+    tone(f, f, 1.3, v); tone(f * 2.01, f * 2.01, .5, v * .3);
+  }
+  function snap() {
+    if (!ac) return;
+    noise(.35, .35, 2500); tone(120, 40, .3, .25);
+    for (let i = 0; i < 9; i++) tone(1400 + Math.random() * 3600, 900, .3, .05, 'sine', Math.random() * .25);
+  }
+
+  /* ---------- setup ---------- */
+  function dims() {
+    DPR = Math.min(devicePixelRatio || 1, 2); W = innerWidth; H = innerHeight; diag = Math.hypot(W, H);
+    cv.width = W * DPR; cv.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+
+  function tie() {
+    broken = false; grab = null; cv.classList.remove('drag');
+    const mx = Math.max(24, W * .06);
+    let span = W - 2 * mx;
+    fs = Math.min(34, Math.max(15, span * 1.35 / (N - 1) / .62));
+    sp = fs * .62; pr = fs * .36;
+    const L = sp * (N - 1);
+    if (L < span * 1.12) span = L / 1.15;
+    const x0 = W / 2 - span / 2, py = Math.max(60, H * .13);
+    const sag = Math.sqrt(Math.max(0, 3 * span * (L - span) / 8));
+    P = []; link = [];
+    for (let i = 0; i < N; i++) {
+      const t = i / (N - 1), x = x0 + span * t, y = py + 4 * sag * t * (1 - t);
+      P.push({ x, y, ox: x, oy: y, ch: TEXT[i], inv: (i === 0 || i === N - 1) ? 0 : 1, w: 0, ang: 0, spin: 0, str: 0, held: false });
+      if (i < N - 1) link.push({ alive: true });
+    }
+    setHint('drag the string', 4200);
+  }
+
+  let hintT = 0;
+  function setHint(txt, ms) {
+    clearTimeout(hintT); hint.textContent = txt; hint.classList.add('on');
+    if (ms) hintT = setTimeout(() => hint.classList.remove('on'), ms);
+  }
+
+  /* ---------- physics ---------- */
+  const SUB = 4, ITER = 16, REST = .5;
+  function substep(h) {
+    const damp = .9992, maxd = 3600 * h;
+
+    for (const p of P) {
+      if (p.held) {
+        const nx = p.x + (ptr.x - p.x) * .55, ny = p.y + (ptr.y - p.y) * .55;
+        p.ox = p.x; p.oy = p.y; p.x = nx; p.y = ny; p.w = 0; continue;
+      }
+      p.w = p.inv;
+      if (!p.inv) continue;
+      let vx = (p.x - p.ox) * damp, vy = (p.y - p.oy) * damp;
+      const m = Math.hypot(vx, vy); if (m > maxd) { vx *= maxd / m; vy *= maxd / m; }
+      p.ox = p.x; p.oy = p.y; p.x += vx; p.y += vy + GRAV * h * h;
+    }
+
+    // letters pile up once the string has snapped
+    if (broken) {
+      const md = pr * 1.7;
+      for (let i = 0; i < N; i++) for (let j = i + 2; j < N; j++) {
+        const a = P[i], b = P[j];
+        if (Math.abs(a.x - b.x) > md || Math.abs(a.y - b.y) > md) continue;
+        const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
+        if (d < md && d > 1e-4) {
+          const k = (md - d) / d * .5;
+          if (a.w) { a.x -= dx * k; a.y -= dy * k; }
+          if (b.w) { b.x += dx * k; b.y += dy * k; }
+        }
+      }
+    }
+
+    // walls
+    for (let i = 0; i < N; i++) {
+      const p = P[i]; if (!p.w) continue;
+      let vx = p.x - p.ox, vy = p.y - p.oy, hit = null, imp = 0;
+      if (p.x < pr) { imp = -vx / h; p.x = pr; p.ox = p.x + vx * REST; hit = 'left'; }
+      else if (p.x > W - pr) { imp = vx / h; p.x = W - pr; p.ox = p.x + vx * REST; hit = 'right'; }
+      if (p.y < pr) { imp = Math.max(imp, -vy / h); p.y = pr; p.oy = p.y + vy * REST; hit = 'top'; }
+      else if (p.y > H - pr) { imp = Math.max(imp, vy / h); p.y = H - pr; p.oy = p.y + vy * REST; p.ox += (p.x - p.ox) * .12; hit = 'bottom'; }
+      if (hit && imp > 160) events.push({ wall: hit, x: p.x, y: p.y, imp, i });
+    }
+
+    // rope: only resists stretching
+    for (let it = 0; it < ITER; it++) {
+      for (let i = 0; i < N - 1; i++) {
+        if (!link[i].alive) continue;
+        const a = P[i], b = P[i + 1], w = a.w + b.w; if (!w) continue;
+        const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1e-4;
+        if (d <= sp) continue;
+        const f = (d - sp) / d;
+        a.x += dx * f * a.w / w; a.y += dy * f * a.w / w;
+        b.x -= dx * f * b.w / w; b.y -= dy * f * b.w / w;
+      }
+    }
+
+    // stress -> snapping
+    const thr = .45 * TOUGH;
+    for (let i = 0; i < N - 1; i++) {
+      if (!link[i].alive) continue;
+      const a = P[i], b = P[i + 1];
+      if ((Math.hypot(b.x - a.x, b.y - a.y) - sp) / sp > thr) { link[i].alive = false; if (!broken) snapRope(i); }
+    }
+  }
+
+  function snapRope() {
+    broken = true;
+    P[0].inv = 0; P[N - 1].inv = 0;           // pins pop out
+    P[0].inv = 1; P[N - 1].inv = 1;
+    for (const p of P) p.spin = (Math.random() - .5) * 12;
+    snap(); setHint('double tap to tie again', 0);
+  }
+
+  /* ---------- page colour ---------- */
+  function bloom(wall, x, y, imp) {
+    const s = Math.min(1, Math.max(0, (imp - 400) / 2200));
+    const far = Math.max(Math.hypot(x, y), Math.hypot(W - x, y), Math.hypot(x, H - y), Math.hypot(W - x, H - y));
+    const max = diag * (.07 + 1.15 * s);
+    blooms.push({ x, y, r: 0, max, col: WALLS[wall], flood: max >= far, hold: 0, dying: false });
+    if (blooms.length > 14) blooms.shift();
+  }
+
+  function updateBlooms(dt) {
+    for (const b of blooms) {
+      b.r += (b.max - b.r) * (1 - Math.exp(-dt * 5));
+      if (b.flood) continue;
+      if (b.r > b.max * .92) b.hold += dt;
+      if (b.hold > .8) b.dying = true;
+      if (b.dying) b.max = Math.max(0, b.max - dt * diag * .7), b.r = Math.min(b.r, b.max);
+    }
+    const f = blooms.findIndex(b => b.flood && b.r >= b.max * .985);
+    if (f >= 0) { base = blooms[f].col; blooms = blooms.slice(f + 1); document.body.style.background = base; }
+    blooms = blooms.filter(b => !(b.dying && b.r < 2));
+  }
+
+  /* ---------- loop ---------- */
+  function update(dt) {
+    const h = dt / SUB;
+    for (let s = 0; s < SUB; s++) substep(h);
+
+    // wall events -> colour + sound
+    if (events.length) {
+      events.sort((a, b) => b.imp - a.imp);
+      const e = events[0];
+      chime(e.i, e.imp);
+      const now = performance.now();
+      if (e.imp > 450 && now - (update.lastBloom || 0) > 300) { bloom(e.wall, e.x, e.y, e.imp); update.lastBloom = now; }
+      events.length = 0;
+    }
+    updateBlooms(dt);
+
+    // fraying + letter angles
+    for (let i = 0; i < N; i++) {
+      const p = P[i];
+      let s = 0;
+      for (const j of [i - 1, i]) if (j >= 0 && j < N - 1 && link[j].alive) {
+        const a = P[j], b = P[j + 1];
+        s = Math.max(s, Math.max(0, Math.hypot(b.x - a.x, b.y - a.y) - sp) / sp / (.45 * TOUGH));
+      }
+      p.str = Math.max(p.str * .9, s);
+      const pi = (i > 0 && link[i - 1].alive) ? i - 1 : i, ni = (i < N - 1 && link[i].alive) ? i + 1 : i;
+      if (pi !== ni) p.ang = Math.atan2(P[ni].y - P[pi].y, P[ni].x - P[pi].x);
+      else { p.ang += p.spin * dt; p.spin *= (p.y > H - pr * 1.5 ? .9 : .995); }
+    }
+  }
+
+  function draw() {
+    ctx.fillStyle = base; ctx.fillRect(0, 0, W, H);
+    for (const b of blooms) { ctx.fillStyle = b.col; ctx.beginPath(); ctx.arc(b.x, b.y, Math.max(0, b.r), 0, TAU); ctx.fill(); }
+
+    // thread
+    ctx.strokeStyle = INK; ctx.globalAlpha = .3; ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = 0; i < N - 1; i++) if (link[i].alive) { ctx.moveTo(P[i].x, P[i].y); ctx.lineTo(P[i + 1].x, P[i + 1].y); }
+    ctx.stroke(); ctx.globalAlpha = 1;
+
+    // pins
+    ctx.fillStyle = INK;
+    for (const i of [0, N - 1]) { ctx.beginPath(); ctx.arc(P[i].x, P[i].y, 3.5, 0, TAU); ctx.fill(); }
+
+    // letters
+    ctx.font = `500 ${fs}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = INK;
+    for (const p of P) {
+      if (p.ch === ' ') continue;
+      const k = Math.min(1, p.str), sh = k > .5 ? (k - .5) * 5 : 0;
+      ctx.globalAlpha = 1 - k * .45;
+      ctx.save();
+      ctx.translate(p.x + (Math.random() - .5) * sh, p.y + (Math.random() - .5) * sh);
+      ctx.rotate(p.ang); ctx.fillText(p.ch, 0, 0); ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  let last = 0;
+  function loop(t) {
+    const dt = Math.min((t - last) / 1000 || .016, .033); last = t;
+    update(dt); draw(); requestAnimationFrame(loop);
+  }
+
+  /* ---------- input ---------- */
+  const pos = e => { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+  let lastTap = 0, down = null;
+  cv.addEventListener('pointerdown', e => {
+    audio();
+    const p = pos(e); ptr = p; down = { x: p.x, y: p.y, t: performance.now(), moved: 0 };
+    let best = Math.max(34, fs * 1.4), idx = -1;
+    P.forEach((q, i) => { const d = Math.hypot(q.x - p.x, q.y - p.y); if (d < best && (q.inv || q.held)) { best = d; idx = i; } });
+    if (idx >= 0) { grab = { id: e.pointerId, idx }; P[idx].held = true; cv.setPointerCapture(e.pointerId); cv.classList.add('drag'); hint.classList.remove('on'); }
+  });
+  cv.addEventListener('pointermove', e => {
+    ptr = pos(e);
+    if (down) down.moved = Math.max(down.moved, Math.hypot(ptr.x - down.x, ptr.y - down.y));
+  });
+  const up = e => {
+    if (grab && e.pointerId === grab.id) { P[grab.idx].held = false; grab = null; cv.classList.remove('drag'); }
+    if (down && down.moved < 10 && performance.now() - down.t < 260) {
+      const n = performance.now();
+      if (n - lastTap < 380 && broken) tie();
+      lastTap = n;
+    }
+    down = null;
+  };
+  cv.addEventListener('pointerup', up);
+  cv.addEventListener('pointercancel', up);
+  addEventListener('keydown', e => { if ((e.key === 'r' || e.key === ' ') && broken) tie(); });
+
+  addEventListener('resize', () => { dims(); if (!broken) tie(); });
+  dims(); tie(); requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

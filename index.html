@@ -22,22 +22,30 @@
 <script>
 (() => {
   /* ---------- tweak here ---------- */
-  const TEXT   = "hi, i'm john doe \u2014 Playing with stuff. Making things I like";
-  const TOUGH  = 1;        // higher = harder to snap, lower = snaps easier
-  const GRAV   = 1900;     // px/s^2
-  const PAPER  = '#efece5', INK = '#151515';
-  const WALLS  = { left: '#f0694b', right: '#8ea6ff', top: '#f1c24a', bottom: '#86c7a0' };
+  const TEXT    = "hi, i'm john doe — Playing with stuff. Making things I like";
+  const PAPER   = '#efece5', INK = '#151515';
+  const WALLS   = { left: '#f0694b', right: '#8ea6ff', top: '#f1c24a', bottom: '#86c7a0' };
+  const NORTH   = '#f0694b', SOUTH = '#8ea6ff';   // magnet ends
+  const FIELD   = 4.2e6;   // magnet strength
+  const STICK   = 170;     // how hard it is to pull a letter loose (px/s^2)
+  const FILINGS = 1;       // density of the iron filings (0 hides them)
   /* -------------------------------- */
 
   const cv = document.getElementById('c'), ctx = cv.getContext('2d'), hint = document.getElementById('hint');
-  const N = TEXT.length, TAU = Math.PI * 2;
-  let W = 0, H = 0, DPR = 1, fs = 24, sp = 15, pr = 8, diag = 1000;
-  let P = [], link = [], broken = false;
-  let base = PAPER, blooms = [];
-  let grab = null, ptr = { x: 0, y: 0 }, events = [];
+  const TAU = Math.PI * 2, HP = Math.PI / 2;
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const wrapHP = a => ((a + HP) % Math.PI + Math.PI) % Math.PI - HP;   // undirected angle, [-pi/2, pi/2)
+
+  let W = 0, H = 0, DPR = 1, diag = 1000;
+  let fs = 24, sp = 15, lr = 7;        // letter size, spacing, radius
+  let Lm = 120, tm = 24, half = 48;    // magnet length, thickness, pole offset
+  let LET = [], MAG = [], blockBottom = 0;
+  let base = PAPER, blooms = [], events = [];
+  let ptr = { x: 0, y: 0 }, grab = null, down = null, lastTap = 0;
+  let hintShown = { flip: false, reset: false }, hintT = 0;
 
   /* ---------- sound (synthesized) ---------- */
-  let ac = null, lastSnd = 0;
+  let ac = null, lastSnd = 0, lastClack = 0;
   const audio = () => { if (!ac) { try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch { return null; } } if (ac.state === 'suspended') ac.resume(); return ac; };
   function tone(f0, f1, dur, peak, type = 'sine', delay = 0) {
     const a = ac; if (!a) return;
@@ -62,125 +70,301 @@
     const v = Math.min(.2, .03 + imp * .00005);
     tone(f, f, 1.3, v); tone(f * 2.01, f * 2.01, .5, v * .3);
   }
-  function snap() {
+  function clack(imp) {                      // two magnets meeting
     if (!ac) return;
-    noise(.35, .35, 2500); tone(120, 40, .3, .25);
-    for (let i = 0; i < 9; i++) tone(1400 + Math.random() * 3600, 900, .3, .05, 'sine', Math.random() * .25);
+    const n = performance.now(); if (n - lastClack < 70) return; lastClack = n;
+    const v = Math.min(.32, .06 + imp * .0004);
+    noise(.07, v, 1400); tone(210, 70, .12, v * .8, 'triangle');
   }
+  function flipSound() { if (!ac) return; noise(.05, .12, 3000); tone(520, 320, .09, .08, 'triangle'); }
 
-  /* ---------- setup ---------- */
-  function dims() {
-    DPR = Math.min(devicePixelRatio || 1, 2); W = innerWidth; H = innerHeight; diag = Math.hypot(W, H);
-    cv.width = W * DPR; cv.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  }
-
-  function tie() {
-    broken = false; grab = null; cv.classList.remove('drag');
-    const mx = Math.max(24, W * .06);
-    let span = W - 2 * mx;
-    fs = Math.min(34, Math.max(15, span * 1.35 / (N - 1) / .62));
-    sp = fs * .62; pr = fs * .36;
-    const L = sp * (N - 1);
-    if (L < span * 1.12) span = L / 1.15;
-    const x0 = W / 2 - span / 2, py = Math.max(60, H * .13);
-    const sag = Math.sqrt(Math.max(0, 3 * span * (L - span) / 8));
-    P = []; link = [];
-    for (let i = 0; i < N; i++) {
-      const t = i / (N - 1), x = x0 + span * t, y = py + 4 * sag * t * (1 - t);
-      P.push({ x, y, ox: x, oy: y, ch: TEXT[i], inv: (i === 0 || i === N - 1) ? 0 : 1, w: 0, ang: 0, spin: 0, str: 0, held: false });
-      if (i < N - 1) link.push({ alive: true });
+  /* ---------- field ---------- */
+  const MAXM = 8;
+  const PX = new Float64Array(MAXM * 2), PY = new Float64Array(MAXM * 2), PQ = new Float64Array(MAXM * 2);
+  let np = 0, FBX = 0, FBY = 0;
+  const E2 = 24 * 24;                        // softening: the table sits a little below the poles
+  function updatePoles() {
+    np = 0;
+    for (const m of MAG) {
+      const ux = Math.cos(m.a), uy = Math.sin(m.a);
+      PX[np] = m.x + ux * half; PY[np] = m.y + uy * half; PQ[np++] = m.s;
+      PX[np] = m.x - ux * half; PY[np] = m.y - uy * half; PQ[np++] = -m.s;
     }
-    setHint('drag the string', 4200);
+  }
+  function field(x, y) {
+    let bx = 0, by = 0;
+    for (let k = 0; k < np; k++) {
+      const dx = x - PX[k], dy = y - PY[k], d2 = dx * dx + dy * dy + E2;
+      const inv = PQ[k] * FIELD / (d2 * Math.sqrt(d2));
+      bx += dx * inv; by += dy * inv;
+    }
+    FBX = bx; FBY = by;
   }
 
-  let hintT = 0;
-  function setHint(txt, ms) {
-    clearTimeout(hintT); hint.textContent = txt; hint.classList.add('on');
-    if (ms) hintT = setTimeout(() => hint.classList.remove('on'), ms);
+  /* ---------- iron filings (the field, drawn) ---------- */
+  let FN = 0, FXs, FYs, FT0, FT, FS, FMASK;
+  const CELL = 10; let gw = 0, gh = 0;
+  function makeFilings() {
+    FN = FILINGS > 0 ? Math.floor(clamp(W * H / 250, 2200, 6500) * FILINGS) : 0;
+    FXs = new Float32Array(FN); FYs = new Float32Array(FN); FT0 = new Float32Array(FN); FT = new Float32Array(FN); FS = new Float32Array(FN);
+    const g = Math.sqrt(W * H / Math.max(FN, 1)), cols = Math.ceil(W / g) + 1;
+    for (let i = 0; i < FN; i++) {
+      const c = i % cols, r = Math.floor(i / cols);
+      FXs[i] = clamp((c + .5 + (Math.random() - .5) * .9) * g, 0, W);
+      FYs[i] = clamp((r + .5 + (Math.random() - .5) * .9) * g, 0, H);
+      FT0[i] = (Math.random() - .5) * Math.PI; FT[i] = FT0[i];
+    }
+    gw = Math.ceil(W / CELL); gh = Math.ceil(H / CELL); FMASK = new Uint8Array(gw * gh);
+  }
+  function updateFilings(dt) {
+    const BON = 26, BREF = 700;
+    for (let i = 0; i < FN; i++) {
+      field(FXs[i], FYs[i]);
+      const mag = Math.sqrt(FBX * FBX + FBY * FBY);
+      const s = mag / (mag + BREF);                        // 0..1, brightness / length
+      const m = clamp(mag / BON, 0, 1);                    // how much the field overrides the random rest angle
+      const m2 = m * m * (3 - 2 * m);
+      const vx = (1 - m2) * Math.cos(2 * FT0[i]) + m2 * Math.cos(2 * Math.atan2(FBY, FBX));
+      const vy = (1 - m2) * Math.sin(2 * FT0[i]) + m2 * Math.sin(2 * Math.atan2(FBY, FBX));
+      const target = Math.atan2(vy, vx) / 2;
+      const k = 2.5 + 45 * s;
+      FT[i] += wrapHP(target - FT[i]) * (1 - Math.exp(-k * dt));
+      FS[i] = s;
+    }
+  }
+
+  /* ---------- letters ---------- */
+  const MU_L = () => STICK, VISC_L = 1.3;
+  function layout() {
+    const mx = Math.max(22, W * .07), usable = W - 2 * mx;
+    const N = TEXT.length, lines = W < 560 ? 4 : W < 980 ? 3 : 2;
+    fs = clamp(usable / (Math.ceil(N / lines) * .62), 17, 46);
+    sp = fs * .62; lr = sp * .5 * .97;
+    const cpl = Math.max(6, Math.floor(usable / sp));
+    const words = TEXT.split(' '), rows = []; let cur = '';
+    for (const w of words) { const t = cur ? cur + ' ' + w : w; if (t.length > cpl && cur) { rows.push(cur); cur = w; } else cur = t; }
+    if (cur) rows.push(cur);
+    const lh = fs * 1.5, top = Math.max(fs * 1.4, H * .12);
+    blockBottom = top + rows.length * lh;
+    LET = [];
+    rows.forEach((row, ri) => {
+      const x0 = W / 2 - row.length * sp / 2;
+      for (let i = 0; i < row.length; i++) {
+        if (row[i] === ' ') continue;
+        const x = x0 + (i + .5) * sp, y = top + (ri + .5) * lh;
+        LET.push({ ch: row[i], x, y, hx: x, hy: y, vx: 0, vy: 0, th: 0, w: 0, ax: 0, ay: 0, tq: 0, q: 0, ux: 1, uy: 0 });
+      }
+    });
+  }
+
+  /* ---------- magnets ---------- */
+  function sizeMagnets() {
+    Lm = clamp(Math.min(W, H) * .3, 96, 170); tm = Lm * .21; half = (Lm - tm) / 2;
+  }
+  function makeMagnets() {
+    sizeMagnets();
+    const y0 = Math.min(H - Lm * 1.5, Math.max(blockBottom + Lm * 1.25, H * .6));
+    const specs = [
+      [W * .22, y0, -.5, 1],
+      [W * .78, y0 + Lm * .15, .6, -1],
+      [W * .5, y0 + Lm * 1.1, 1.57, 1],
+    ];
+    MAG = specs.map(([x, y, a, s]) => ({
+      x: clamp(x, Lm * .6, W - Lm * .6), y: clamp(y, Lm * .6, H - Lm * .5 - 40), a, s,
+      vx: 0, vy: 0, w: 0, fx: 0, fy: 0, tq: 0,
+    }));
+    grab = null;
+  }
+  const IMAG = () => Lm * Lm / 12 + tm * tm / 16;
+
+  function segSeg(p1x, p1y, q1x, q1y, p2x, p2y, q2x, q2y) {   // closest points of two segments -> out
+    const d1x = q1x - p1x, d1y = q1y - p1y, d2x = q2x - p2x, d2y = q2y - p2y, rx = p1x - p2x, ry = p1y - p2y;
+    const a = d1x * d1x + d1y * d1y, e = d2x * d2x + d2y * d2y, f = d2x * rx + d2y * ry;
+    let s, t;
+    const c = d1x * rx + d1y * ry, b = d1x * d2x + d1y * d2y, den = a * e - b * b;
+    s = den > 1e-9 ? clamp((b * f - c * e) / den, 0, 1) : 0;
+    t = (b * s + f) / e;
+    if (t < 0) { t = 0; s = clamp(-c / a, 0, 1); } else if (t > 1) { t = 1; s = clamp((b - c) / a, 0, 1); }
+    segSeg.out = [p1x + d1x * s, p1y + d1y * s, p2x + d2x * t, p2y + d2y * t];
+    return segSeg.out;
   }
 
   /* ---------- physics ---------- */
-  const SUB = 4, ITER = 16, REST = .5;
-  function substep(h) {
-    const damp = .9992, maxd = 3600 * h;
+  const MU_M = 280, VISC_M = .9, MU_W = 9, VISC_W = 2.2;
+  const KC = 2.2e4, CC = 60, FMAX = 14000, EM2 = 16 * 16;
+  const BSAT = 1800, CHI = 1, KT = 900, MU_WL = 330, COUPLE = .14;
 
-    for (const p of P) {
-      if (p.held) {
-        const nx = p.x + (ptr.x - p.x) * .55, ny = p.y + (ptr.y - p.y) * .55;
-        p.ox = p.x; p.oy = p.y; p.x = nx; p.y = ny; p.w = 0; continue;
+  function wallHit(m, nx, ny, rx, ry, pen, I) {
+    m.x += nx * pen; m.y += ny * pen;
+    const vn = (m.vx - m.w * ry) * nx + (m.vy + m.w * rx) * ny;
+    if (vn >= 0) return;
+    const cr = rx * ny - ry * nx, j = -(1 + .55) * vn / (1 + cr * cr / I);
+    m.vx += j * nx; m.vy += j * ny; m.w += cr * j / I;
+    if (-vn > 90) events.push({ kind: 'wall', wall: nx > 0 ? 'left' : nx < 0 ? 'right' : ny > 0 ? 'top' : 'bottom', x: m.x + rx, y: m.y + ry, imp: -vn * 3, i: Math.floor(Math.random() * 20) });
+  }
+
+  function step(h) {
+    const I = IMAG();
+    updatePoles();
+    for (const m of MAG) { m.fx = 0; m.fy = 0; m.tq = 0; }
+
+    // magnet <-> magnet: pole forces and capsule contact
+    for (let i = 0; i < MAG.length; i++) for (let j = i + 1; j < MAG.length; j++) {
+      const A = MAG[i], B = MAG[j];
+      for (let a = 0; a < 2; a++) for (let b = 0; b < 2; b++) {
+        const ka = 2 * i + a, kb = 2 * j + b;
+        const dx = PX[ka] - PX[kb], dy = PY[ka] - PY[kb], d2 = dx * dx + dy * dy + EM2;
+        const inv = FIELD * PQ[ka] * PQ[kb] / (d2 * Math.sqrt(d2));
+        let fx = dx * inv, fy = dy * inv; const f = Math.hypot(fx, fy);
+        if (f > FMAX) { fx *= FMAX / f; fy *= FMAX / f; }
+        A.fx += fx; A.fy += fy; A.tq += (PX[ka] - A.x) * fy - (PY[ka] - A.y) * fx;
+        B.fx -= fx; B.fy -= fy; B.tq -= (PX[kb] - B.x) * fy - (PY[kb] - B.y) * fx;
       }
-      p.w = p.inv;
-      if (!p.inv) continue;
-      let vx = (p.x - p.ox) * damp, vy = (p.y - p.oy) * damp;
-      const m = Math.hypot(vx, vy); if (m > maxd) { vx *= maxd / m; vy *= maxd / m; }
-      p.ox = p.x; p.oy = p.y; p.x += vx; p.y += vy + GRAV * h * h;
+      const ax = Math.cos(A.a) * half, ay = Math.sin(A.a) * half, bx = Math.cos(B.a) * half, by = Math.sin(B.a) * half;
+      const [c1x, c1y, c2x, c2y] = segSeg(A.x - ax, A.y - ay, A.x + ax, A.y + ay, B.x - bx, B.y - by, B.x + bx, B.y + by);
+      let nx = c2x - c1x, ny = c2y - c1y, d = Math.hypot(nx, ny);
+      if (d < tm) {
+        if (d < 1e-4) { nx = -Math.sin(A.a); ny = Math.cos(A.a); d = 1; } else { nx /= d; ny /= d; }
+        const v1x = A.vx - A.w * (c1y - A.y), v1y = A.vy + A.w * (c1x - A.x);
+        const v2x = B.vx - B.w * (c2y - B.y), v2y = B.vy + B.w * (c2x - B.x);
+        const rel = (v2x - v1x) * nx + (v2y - v1y) * ny;
+        const f = Math.max(0, KC * (tm - d) - CC * rel);
+        if (rel < -45) events.push({ kind: 'clack', imp: -rel, x: (c1x + c2x) / 2, y: (c1y + c2y) / 2 });
+        B.fx += nx * f; B.fy += ny * f; B.tq += (c2x - B.x) * ny * f - (c2y - B.y) * nx * f;
+        A.fx -= nx * f; A.fy -= ny * f; A.tq -= (c1x - A.x) * ny * f - (c1y - A.y) * nx * f;
+      }
     }
 
-    // letters pile up once the string has snapped
-    if (broken) {
-      const md = pr * 1.7;
-      for (let i = 0; i < N; i++) for (let j = i + 2; j < N; j++) {
-        const a = P[i], b = P[j];
-        if (Math.abs(a.x - b.x) > md || Math.abs(a.y - b.y) > md) continue;
-        const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
-        if (d < md && d > 1e-4) {
-          const k = (md - d) / d * .5;
-          if (a.w) { a.x -= dx * k; a.y -= dy * k; }
-          if (b.w) { b.x += dx * k; b.y += dy * k; }
+    // pointer spring on the magnet being held
+    if (grab) {
+      const m = grab.m, c = Math.cos(m.a), s = Math.sin(m.a);
+      const rx = c * grab.lx - s * grab.ly, ry = s * grab.lx + c * grab.ly;
+      const gx = m.x + rx, gy = m.y + ry, vx = m.vx - m.w * ry, vy = m.vy + m.w * rx;
+      let fx = 80 * (ptr.x - gx) - 16 * vx, fy = 80 * (ptr.y - gy) - 16 * vy; const f = Math.hypot(fx, fy);
+      if (f > 12000) { fx *= 12000 / f; fy *= 12000 / f; }
+      m.fx += fx; m.fy += fy; m.tq += rx * fy - ry * fx;
+    }
+
+    // integrate magnets
+    for (const m of MAG) {
+      m.vx += m.fx * h; m.vy += m.fy * h; m.w += m.tq / I * h;
+      let v = Math.hypot(m.vx, m.vy);
+      if (v < MU_M * h) { m.vx = 0; m.vy = 0; } else { const k = 1 - MU_M * h / v; m.vx *= k; m.vy *= k; }
+      if (Math.abs(m.w) < MU_W * h) m.w = 0; else m.w -= Math.sign(m.w) * MU_W * h;
+      const dv = Math.exp(-VISC_M * h), dw = Math.exp(-VISC_W * h);
+      m.vx *= dv; m.vy *= dv; m.w *= dw;
+      m.x += m.vx * h; m.y += m.vy * h; m.a += m.w * h;
+      const ux = Math.cos(m.a) * half, uy = Math.sin(m.a) * half, r = tm / 2;
+      for (const sg of [-1, 1]) {
+        const ex = sg * ux, ey = sg * uy;
+        if (m.x + ex < r) wallHit(m, 1, 0, ex, ey, r - (m.x + ex), I);
+        else if (m.x + ex > W - r) wallHit(m, -1, 0, ex, ey, m.x + ex - (W - r), I);
+        if (m.y + ey < r) wallHit(m, 0, 1, ex, ey, r - (m.y + ey), I);
+        else if (m.y + ey > H - r) wallHit(m, 0, -1, ex, ey, m.y + ey - (H - r), I);
+      }
+    }
+
+    // letters: induced dipoles, pulled toward strong field, turned along field lines
+    updatePoles();
+    const lh = sp * .45;
+    for (const p of LET) {
+      field(p.x, p.y);
+      const bx = FBX, by = FBY, mag = Math.sqrt(bx * bx + by * by);
+      p.ax = 0; p.ay = 0; p.tq = 0; p.q = 0;
+      if (mag > 1) {
+        const s = mag / (mag + BSAT), q = CHI * s, ux = bx / mag, uy = by / mag;
+        field(p.x + ux * lh, p.y + uy * lh); const b1x = FBX, b1y = FBY;
+        field(p.x - ux * lh, p.y - uy * lh);
+        p.ax = q * (b1x - FBX); p.ay = q * (b1y - FBY);
+        p.q = q; p.ux = ux; p.uy = uy;
+        p.tq = -KT * s * Math.sin(2 * (p.th - Math.atan2(by, bx)));
+      }
+    }
+    // chains: neighbouring induced dipoles attract head to tail
+    const cut = fs * 5, cut2 = cut * cut, el2 = 8 * 8;
+    for (let i = 0; i < LET.length; i++) {
+      const a = LET[i]; if (a.q < .03) continue;
+      for (let j = i + 1; j < LET.length; j++) {
+        const b = LET[j]; if (b.q < .03) continue;
+        const ddx = b.x - a.x, ddy = b.y - a.y; if (ddx * ddx + ddy * ddy > cut2) continue;
+        let fx = 0, fy = 0;
+        for (const sa of [1, -1]) for (const sb of [1, -1]) {
+          const rx = a.x + sa * a.ux * lh - (b.x + sb * b.ux * lh), ry = a.y + sa * a.uy * lh - (b.y + sb * b.uy * lh);
+          const d2 = rx * rx + ry * ry + el2, inv = FIELD * COUPLE * sa * a.q * sb * b.q / (d2 * Math.sqrt(d2));
+          fx += rx * inv; fy += ry * inv;
+        }
+        const f = Math.hypot(fx, fy); if (f > 5000) { fx *= 5000 / f; fy *= 5000 / f; }
+        a.ax += fx; a.ay += fy; b.ax -= fx; b.ay -= fy;
+      }
+    }
+    const mu = MU_L(), dvl = Math.exp(-VISC_L * h), dwl = Math.exp(-7 * h);
+    for (const p of LET) {
+      p.vx += p.ax * h; p.vy += p.ay * h;
+      let v = Math.hypot(p.vx, p.vy);
+      if (v < mu * h) { p.vx = 0; p.vy = 0; v = 0; } else { const k = 1 - mu * h / v; p.vx *= k; p.vy *= k; v *= k; }
+      if (v > 2600) { p.vx *= 2600 / v; p.vy *= 2600 / v; }
+      p.vx *= dvl; p.vy *= dvl;
+      p.x += p.vx * h; p.y += p.vy * h;
+      p.w += p.tq * h;
+      if (Math.abs(p.w) < MU_WL * h) p.w = 0; else p.w -= Math.sign(p.w) * MU_WL * h;
+      p.w *= dwl; p.th += p.w * h;
+    }
+
+    // letter contacts
+    for (let it = 0; it < 2; it++) {
+      for (let i = 0; i < LET.length; i++) for (let j = i + 1; j < LET.length; j++) {
+        const a = LET[i], b = LET[j], dx = b.x - a.x, dy = b.y - a.y, m2 = 4 * lr * lr;
+        if (dx > 2 * lr || dx < -2 * lr || dy > 2 * lr || dy < -2 * lr) continue;
+        const d2 = dx * dx + dy * dy; if (d2 >= m2) continue;
+        let d = Math.sqrt(d2), nx, ny;
+        if (d < 1e-4) { nx = 1; ny = 0; d = 0; } else { nx = dx / d; ny = dy / d; }
+        const pen = (2 * lr - d) / 2;
+        a.x -= nx * pen; a.y -= ny * pen; b.x += nx * pen; b.y += ny * pen;
+        const rv = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+        if (rv < 0) { const j2 = -(1 + .1) * rv / 2; a.vx -= j2 * nx; a.vy -= j2 * ny; b.vx += j2 * nx; b.vy += j2 * ny; }
+      }
+    }
+    const ML = .06;                                  // letter mass relative to a magnet
+    for (const m of MAG) {
+      const ux = Math.cos(m.a), uy = Math.sin(m.a), rr = tm / 2;
+      for (let i = 0; i < LET.length; i++) {
+        const p = LET[i], rx = p.x - m.x, ry = p.y - m.y, s = clamp(rx * ux + ry * uy, -half, half);
+        const cx = m.x + ux * s, cy = m.y + uy * s;
+        let dx = p.x - cx, dy = p.y - cy, d = Math.hypot(dx, dy); const min = rr + lr;
+        if (d >= min) continue;
+        if (d < 1e-4) { dx = -uy; dy = ux; d = 1; }
+        const nx = dx / d, ny = dy / d;
+        p.x = cx + nx * min; p.y = cy + ny * min;
+        const vcx = m.vx - m.w * (cy - m.y), vcy = m.vy + m.w * (cx - m.x);
+        const rel = (p.vx - vcx) * nx + (p.vy - vcy) * ny;
+        if (rel < 0) {
+          const crs = (cx - m.x) * ny - (cy - m.y) * nx;
+          const j = -(1 + .12) * rel / (1 / ML + 1 + crs * crs / I);
+          p.vx += j * nx / ML; p.vy += j * ny / ML;
+          m.vx -= j * nx; m.vy -= j * ny; m.w -= crs * j / I;
+          if (-rel > 160) events.push({ kind: 'tick', imp: -rel, i });
         }
       }
     }
-
-    // walls
-    for (let i = 0; i < N; i++) {
-      const p = P[i]; if (!p.w) continue;
-      let vx = p.x - p.ox, vy = p.y - p.oy, hit = null, imp = 0;
-      if (p.x < pr) { imp = -vx / h; p.x = pr; p.ox = p.x + vx * REST; hit = 'left'; }
-      else if (p.x > W - pr) { imp = vx / h; p.x = W - pr; p.ox = p.x + vx * REST; hit = 'right'; }
-      if (p.y < pr) { imp = Math.max(imp, -vy / h); p.y = pr; p.oy = p.y + vy * REST; hit = 'top'; }
-      else if (p.y > H - pr) { imp = Math.max(imp, vy / h); p.y = H - pr; p.oy = p.y + vy * REST; p.ox += (p.x - p.ox) * .12; hit = 'bottom'; }
-      if (hit && imp > 160) events.push({ wall: hit, x: p.x, y: p.y, imp, i });
+    for (let i = 0; i < LET.length; i++) {
+      const p = LET[i];
+      let hit = null, imp = 0;
+      if (p.x < lr) { imp = -p.vx; p.x = lr; p.vx = -p.vx * .35; hit = 'left'; }
+      else if (p.x > W - lr) { imp = p.vx; p.x = W - lr; p.vx = -p.vx * .35; hit = 'right'; }
+      if (p.y < lr) { imp = Math.max(imp, -p.vy); p.y = lr; p.vy = -p.vy * .35; hit = 'top'; }
+      else if (p.y > H - lr) { imp = Math.max(imp, p.vy); p.y = H - lr; p.vy = -p.vy * .35; hit = 'bottom'; }
+      if (hit && imp > 160) events.push({ kind: 'wall', wall: hit, x: p.x, y: p.y, imp, i });
     }
-
-    // rope: only resists stretching
-    for (let it = 0; it < ITER; it++) {
-      for (let i = 0; i < N - 1; i++) {
-        if (!link[i].alive) continue;
-        const a = P[i], b = P[i + 1], w = a.w + b.w; if (!w) continue;
-        const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 1e-4;
-        if (d <= sp) continue;
-        const f = (d - sp) / d;
-        a.x += dx * f * a.w / w; a.y += dy * f * a.w / w;
-        b.x -= dx * f * b.w / w; b.y -= dy * f * b.w / w;
-      }
-    }
-
-    // stress -> snapping
-    const thr = .45 * TOUGH;
-    for (let i = 0; i < N - 1; i++) {
-      if (!link[i].alive) continue;
-      const a = P[i], b = P[i + 1];
-      if ((Math.hypot(b.x - a.x, b.y - a.y) - sp) / sp > thr) { link[i].alive = false; if (!broken) snapRope(i); }
-    }
-  }
-
-  function snapRope() {
-    broken = true;
-    P[0].inv = 0; P[N - 1].inv = 0;           // pins pop out
-    P[0].inv = 1; P[N - 1].inv = 1;
-    for (const p of P) p.spin = (Math.random() - .5) * 12;
-    snap(); setHint('double tap to tie again', 0);
   }
 
   /* ---------- page colour ---------- */
   function bloom(wall, x, y, imp) {
-    const s = Math.min(1, Math.max(0, (imp - 400) / 2200));
+    const s = clamp((imp - 400) / 2200, 0, 1);
     const far = Math.max(Math.hypot(x, y), Math.hypot(W - x, y), Math.hypot(x, H - y), Math.hypot(W - x, H - y));
     const max = diag * (.07 + 1.15 * s);
     blooms.push({ x, y, r: 0, max, col: WALLS[wall], flood: max >= far, hold: 0, dying: false });
     if (blooms.length > 14) blooms.shift();
   }
-
   function updateBlooms(dt) {
     for (const b of blooms) {
       b.r += (b.max - b.r) * (1 - Math.exp(-dt * 5));
@@ -194,62 +378,92 @@
     blooms = blooms.filter(b => !(b.dying && b.r < 2));
   }
 
+  /* ---------- hints ---------- */
+  function setHint(txt, ms) {
+    clearTimeout(hintT); hint.textContent = txt; hint.classList.add('on');
+    if (ms) hintT = setTimeout(() => hint.classList.remove('on'), ms);
+  }
+  function resetWords() {
+    for (const p of LET) { p.x = p.hx; p.y = p.hy; p.vx = p.vy = 0; p.th = 0; p.w = 0; }
+    makeMagnets();                                   // magnets go back to their corners so they don't grab the words again
+    hintShown.reset = false; hint.classList.remove('on');
+  }
+
   /* ---------- loop ---------- */
+  const SUB = 4;
+  let lastScatterCheck = 0;
   function update(dt) {
     const h = dt / SUB;
-    for (let s = 0; s < SUB; s++) substep(h);
+    for (let s = 0; s < SUB; s++) step(h);
 
-    // wall events -> colour + sound
     if (events.length) {
       events.sort((a, b) => b.imp - a.imp);
-      const e = events[0];
-      chime(e.i, e.imp);
-      const now = performance.now();
-      if (e.imp > 450 && now - (update.lastBloom || 0) > 300) { bloom(e.wall, e.x, e.y, e.imp); update.lastBloom = now; }
+      const e = events[0], now = performance.now();
+      if (e.kind === 'clack') clack(e.imp);
+      else if (e.kind === 'wall') {
+        chime(e.i || 0, e.imp);
+        if (e.imp > 450 && now - (update.lastBloom || 0) > 300) { bloom(e.wall, e.x, e.y, e.imp); update.lastBloom = now; }
+      } else if (e.kind === 'tick') chime(e.i || 0, e.imp * .25);
       events.length = 0;
     }
     updateBlooms(dt);
+    updateFilings(dt);
 
-    // fraying + letter angles
-    for (let i = 0; i < N; i++) {
-      const p = P[i];
-      let s = 0;
-      for (const j of [i - 1, i]) if (j >= 0 && j < N - 1 && link[j].alive) {
-        const a = P[j], b = P[j + 1];
-        s = Math.max(s, Math.max(0, Math.hypot(b.x - a.x, b.y - a.y) - sp) / sp / (.45 * TOUGH));
-      }
-      p.str = Math.max(p.str * .9, s);
-      const pi = (i > 0 && link[i - 1].alive) ? i - 1 : i, ni = (i < N - 1 && link[i].alive) ? i + 1 : i;
-      if (pi !== ni) p.ang = Math.atan2(P[ni].y - P[pi].y, P[ni].x - P[pi].x);
-      else { p.ang += p.spin * dt; p.spin *= (p.y > H - pr * 1.5 ? .9 : .995); }
+    const t = performance.now();
+    if (t - lastScatterCheck > 500) {
+      lastScatterCheck = t;
+      let away = 0; for (const p of LET) if (Math.hypot(p.x - p.hx, p.y - p.hy) > fs * 1.5) away++;
+      if (away > 6 && !hintShown.reset) { hintShown.reset = true; setHint('double tap to put the words back', 5200); }
     }
+  }
+
+  function drawMagnet(m) {
+    ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(m.a);
+    const r = tm / 2, l = Lm / 2;
+    const path = () => { ctx.beginPath(); ctx.moveTo(-l + r, -r); ctx.lineTo(l - r, -r); ctx.arc(l - r, 0, r, -HP, HP); ctx.lineTo(-l + r, r); ctx.arc(-l + r, 0, r, HP, -HP); ctx.closePath(); };
+    path(); ctx.fillStyle = m.s > 0 ? SOUTH : NORTH; ctx.fill();
+    ctx.save(); path(); ctx.clip(); ctx.fillStyle = m.s > 0 ? NORTH : SOUTH; ctx.fillRect(0, -r, l, tm); ctx.restore();
+    path(); ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, -r); ctx.lineTo(0, r); ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.restore();
   }
 
   function draw() {
     ctx.fillStyle = base; ctx.fillRect(0, 0, W, H);
     for (const b of blooms) { ctx.fillStyle = b.col; ctx.beginPath(); ctx.arc(b.x, b.y, Math.max(0, b.r), 0, TAU); ctx.fill(); }
 
-    // thread
-    ctx.strokeStyle = INK; ctx.globalAlpha = .3; ctx.lineWidth = 1; ctx.beginPath();
-    for (let i = 0; i < N - 1; i++) if (link[i].alive) { ctx.moveTo(P[i].x, P[i].y); ctx.lineTo(P[i + 1].x, P[i + 1].y); }
-    ctx.stroke(); ctx.globalAlpha = 1;
-
-    // pins
-    ctx.fillStyle = INK;
-    for (const i of [0, N - 1]) { ctx.beginPath(); ctx.arc(P[i].x, P[i].y, 3.5, 0, TAU); ctx.fill(); }
-
-    // letters
-    ctx.font = `500 ${fs}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = INK;
-    for (const p of P) {
-      if (p.ch === ' ') continue;
-      const k = Math.min(1, p.str), sh = k > .5 ? (k - .5) * 5 : 0;
-      ctx.globalAlpha = 1 - k * .45;
-      ctx.save();
-      ctx.translate(p.x + (Math.random() - .5) * sh, p.y + (Math.random() - .5) * sh);
-      ctx.rotate(p.ang); ctx.fillText(p.ch, 0, 0); ctx.restore();
+    // mark where letters are so the filings step around them
+    FMASK.fill(0);
+    const rr = Math.ceil((lr * 1.25) / CELL);
+    for (const p of LET) {
+      const cx = Math.floor(p.x / CELL), cy = Math.floor(p.y / CELL);
+      for (let y = cy - rr; y <= cy + rr; y++) for (let x = cx - rr; x <= cx + rr; x++)
+        if (x >= 0 && y >= 0 && x < gw && y < gh) FMASK[y * gw + x] = 1;
+    }
+    // filings: four alpha buckets
+    ctx.strokeStyle = INK; ctx.lineWidth = 1; ctx.lineCap = 'round';
+    const ALPHA = [.16, .3, .5, .75];
+    for (let b = 0; b < 4; b++) {
+      ctx.globalAlpha = ALPHA[b]; ctx.beginPath();
+      for (let i = 0; i < FN; i++) {
+        const s = FS[i], bk = s < .06 ? 0 : s < .22 ? 1 : s < .5 ? 2 : 3;
+        if (bk !== b) continue;
+        const x = FXs[i], y = FYs[i];
+        if (FMASK[Math.floor(y / CELL) * gw + Math.floor(x / CELL)]) continue;
+        const l = (3.2 + 6.5 * s) / 2, c = Math.cos(FT[i]) * l, sn = Math.sin(FT[i]) * l;
+        ctx.moveTo(x - c, y - sn); ctx.lineTo(x + c, y + sn);
+      }
+      ctx.stroke();
     }
     ctx.globalAlpha = 1;
+
+    for (const m of MAG) drawMagnet(m);
+
+    ctx.font = `500 ${fs}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = INK;
+    for (const p of LET) {
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.th); ctx.fillText(p.ch, 0, 0); ctx.restore();
+    }
   }
 
   let last = 0;
@@ -260,33 +474,63 @@
 
   /* ---------- input ---------- */
   const pos = e => { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
-  let lastTap = 0, down = null;
+  function pickMagnet(p) {
+    let best = tm * .5 + 22, hit = null;
+    for (const m of MAG) {
+      const ux = Math.cos(m.a), uy = Math.sin(m.a), s = clamp((p.x - m.x) * ux + (p.y - m.y) * uy, -half, half);
+      const d = Math.hypot(p.x - (m.x + ux * s), p.y - (m.y + uy * s));
+      if (d < best) { best = d; hit = m; }
+    }
+    return hit;
+  }
   cv.addEventListener('pointerdown', e => {
     audio();
-    const p = pos(e); ptr = p; down = { x: p.x, y: p.y, t: performance.now(), moved: 0 };
-    let best = Math.max(34, fs * 1.4), idx = -1;
-    P.forEach((q, i) => { const d = Math.hypot(q.x - p.x, q.y - p.y); if (d < best && (q.inv || q.held)) { best = d; idx = i; } });
-    if (idx >= 0) { grab = { id: e.pointerId, idx }; P[idx].held = true; cv.setPointerCapture(e.pointerId); cv.classList.add('drag'); hint.classList.remove('on'); }
+    const p = pos(e); ptr = p; down = { x: p.x, y: p.y, t: performance.now(), moved: 0, m: null };
+    const m = pickMagnet(p);
+    if (m) {
+      const c = Math.cos(m.a), s = Math.sin(m.a), rx = p.x - m.x, ry = p.y - m.y;
+      grab = { id: e.pointerId, m, lx: c * rx + s * ry, ly: -s * rx + c * ry };
+      down.m = m; cv.setPointerCapture(e.pointerId); cv.classList.add('drag'); hint.classList.remove('on');
+    }
   });
   cv.addEventListener('pointermove', e => {
     ptr = pos(e);
     if (down) down.moved = Math.max(down.moved, Math.hypot(ptr.x - down.x, ptr.y - down.y));
   });
   const up = e => {
-    if (grab && e.pointerId === grab.id) { P[grab.idx].held = false; grab = null; cv.classList.remove('drag'); }
-    if (down && down.moved < 10 && performance.now() - down.t < 260) {
-      const n = performance.now();
-      if (n - lastTap < 380 && broken) tie();
-      lastTap = n;
+    if (grab && e.pointerId === grab.id) { grab = null; cv.classList.remove('drag'); }
+    const n = performance.now();
+    if (down && down.moved < 10 && n - down.t < 260) {
+      if (down.m) {
+        down.m.s *= -1; flipSound();
+      } else {
+        if (n - lastTap < 380) resetWords();
+        lastTap = n;
+      }
+    } else if (down && down.m && !hintShown.flip) {
+      hintShown.flip = true; setHint('tap a magnet to flip it', 3600);
     }
     down = null;
   };
   cv.addEventListener('pointerup', up);
   cv.addEventListener('pointercancel', up);
-  addEventListener('keydown', e => { if ((e.key === 'r' || e.key === ' ') && broken) tie(); });
+  addEventListener('keydown', e => { if (e.key === 'r' || e.key === ' ') resetWords(); });
 
-  addEventListener('resize', () => { dims(); if (!broken) tie(); });
-  dims(); tie(); requestAnimationFrame(loop);
+  /* ---------- setup ---------- */
+  let lastW = 0;
+  function dims() {
+    DPR = Math.min(devicePixelRatio || 1, 2); W = innerWidth; H = innerHeight; diag = Math.hypot(W, H);
+    cv.width = W * DPR; cv.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  function build() { layout(); makeMagnets(); makeFilings(); lastW = W; }
+  addEventListener('resize', () => {
+    dims();
+    if (Math.abs(W - lastW) > 40) build();
+    else { makeFilings(); for (const m of MAG) { m.y = clamp(m.y, Lm * .6, H - Lm * .6); } }   // phone toolbars sliding in and out
+  });
+
+  dims(); build(); setHint('drag a magnet', 4800);
+  requestAnimationFrame(loop);
 })();
 </script>
 </body>
